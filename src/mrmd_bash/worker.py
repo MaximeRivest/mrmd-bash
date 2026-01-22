@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+print("[bash-worker] Loading worker module (stdin detection enabled)", flush=True)
+
 import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -75,6 +78,67 @@ class BashWorker:
         # Find bash executable
         self._bash_path = shutil.which("bash") or "/bin/bash"
 
+    def _build_clean_env(self) -> dict[str, str]:
+        """Build a clean environment like a normal terminal session.
+
+        Instead of inheriting everything from Electron (which sets XDG vars,
+        Electron-specific vars, etc.), we build a minimal environment with
+        only the essential variables a shell needs.
+
+        This makes the shell behave like opening a fresh terminal.
+        """
+        # Essential variables to preserve from the current environment
+        # These are what a normal terminal session would have
+        essential_vars = {
+            # User identity
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            # Locale
+            "LANG",
+            "LANGUAGE",
+            "LC_ALL",
+            "LC_CTYPE",
+            "LC_MESSAGES",
+            "LC_NUMERIC",
+            "LC_TIME",
+            "LC_COLLATE",
+            # Display (needed for GUI apps launched from shell)
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            # Session integration
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "GPG_AGENT_INFO",
+            # Editor preferences
+            "EDITOR",
+            "VISUAL",
+            # Pager
+            "PAGER",
+            # Temp directory
+            "TMPDIR",
+            # Timezone
+            "TZ",
+        }
+
+        env = {}
+
+        # Copy only essential variables
+        for var in essential_vars:
+            if var in os.environ:
+                env[var] = os.environ[var]
+
+        # PATH needs special handling - use system PATH, not Electron's modified one
+        # Try to get a clean PATH by checking common locations
+        env["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+
+        # TERM for proper terminal behavior
+        env["TERM"] = "xterm-256color"
+
+        return env
+
     def _ensure_started(self) -> None:
         """Ensure the bash process is running."""
         if self._process is not None and self._process.poll() is None:
@@ -83,20 +147,19 @@ class BashWorker:
         # Create PTY for proper terminal handling
         self._master_fd, slave_fd = pty.openpty()
 
-        # Set up environment
-        env = os.environ.copy()
+        # Set up a clean environment like a normal terminal
+        # Don't inherit Electron's environment (XDG vars, etc.) which can confuse tools
+        env = self._build_clean_env()
         env.update(self._extra_env)
-        # Disable any prompts that might interfere
-        env["PS1"] = ""
-        env["PS2"] = ""
-        env["PS3"] = ""
-        env["PS4"] = ""
-        # Ensure consistent behavior
-        env["TERM"] = "xterm-256color"
 
-        # Start bash process
+        # Start bash as login interactive shell
+        # -l (login): sources /etc/profile, ~/.bash_profile or ~/.profile
+        # -i (interactive): enables job control, aliases, etc.
+        # This matches what terminal emulators do and works on both Linux and macOS
+        # (macOS users typically have config in .bash_profile, Linux in .bashrc,
+        # and .bash_profile usually sources .bashrc if it exists)
         self._process = subprocess.Popen(
-            [self._bash_path, "--norc", "--noprofile", "-i"],
+            [self._bash_path, "-l", "-i"],
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -107,16 +170,22 @@ class BashWorker:
 
         os.close(slave_fd)
 
-        # Wait for shell to be ready
-        time.sleep(0.1)
+        # Wait for shell to initialize and source .bashrc
+        time.sleep(0.15)
 
-        # Consume any initial output
-        self._read_available(timeout=0.2)
+        # Consume any initial output (including user's prompt)
+        self._read_available(timeout=0.3)
+
+        # Now override prompts AFTER .bashrc has been sourced
+        # This ensures clean output parsing regardless of user's PS1
+        self._write_command("PS1='' PS2='' PS3='' PS4=''")
+        time.sleep(0.05)
+        self._read_available(timeout=0.1)
 
         # Disable bracketed paste mode which adds escape sequences
         self._write_command("bind 'set enable-bracketed-paste off' 2>/dev/null || true")
-        time.sleep(0.1)
-        self._read_available(timeout=0.2)
+        time.sleep(0.05)
+        self._read_available(timeout=0.1)
 
     def _read_available(self, timeout: float = 0.1) -> str:
         """Read all available output from the process."""
@@ -151,8 +220,9 @@ class BashWorker:
         code: str,
         end_marker: str,
         exit_marker: str,
+        exec_id: str | None = None,
         on_output: Callable[[str, str, str], None] | None = None,
-        on_stdin_request: Callable[[StdinRequest], None] | None = None,
+        on_stdin_request: Callable[[StdinRequest], str] | None = None,
     ) -> tuple[str, int]:
         """Read output until the end marker is found.
 
@@ -160,8 +230,9 @@ class BashWorker:
             code: The user code being executed (used to filter echoed commands)
             end_marker: Unique marker indicating end of output
             exit_marker: Unique marker for exit code
+            exec_id: Execution ID for stdin requests
             on_output: Callback for streaming output
-            on_stdin_request: Callback for stdin requests
+            on_stdin_request: Callback for stdin requests - BLOCKS and returns input string
 
         Returns:
             Tuple of (output, exit_code)
@@ -172,6 +243,23 @@ class BashWorker:
         output_parts: list[str] = []
         accumulated = ""
 
+        # Stdin detection state
+        idle_count = 0  # Count of consecutive idle iterations (no output)
+        IDLE_THRESHOLD = 5  # After 5 iterations (0.5s) of no output, check for stdin need
+
+        # Common prompt patterns that indicate stdin is needed
+        # These patterns at end of output suggest a command is waiting for input
+        PROMPT_PATTERNS = (
+            ': ', '? ', '> ', '] ', ') ',  # Common prompt endings with space
+            ':', '?',  # Without trailing space
+            'password:', 'Password:', 'PASSWORD:',
+            '[y/n]', '[Y/n]', '[y/N]', '[Y/N]',
+            '(yes/no)', '(y/n)',
+        )
+
+        # Get code lines to filter echoed commands (PTY echoes back what we send)
+        code_lines_set = set(line.strip() for line in code.strip().split("\n") if line.strip())
+
         while True:
             ready, _, _ = select.select([self._master_fd], [], [], 0.1)
 
@@ -181,6 +269,8 @@ class BashWorker:
                 raise InputCancelledError("Input cancelled by user")
 
             if ready:
+                # Reset idle counter when we receive data
+                idle_count = 0
                 try:
                     data = os.read(self._master_fd, 4096)
                     if not data:
@@ -189,19 +279,109 @@ class BashWorker:
                     output_parts.append(chunk)
                     accumulated = "".join(output_parts)
 
-                    # Call output callback
+                    # Call output callback with filtered chunk
+                    # Filter out: markers, echo commands for markers, and echoed user commands
                     if on_output:
-                        on_output("stdout", chunk, accumulated)
+                        lines = chunk.split("\n")
+                        filtered_lines = []
+                        for line in lines:
+                            stripped = line.strip()
+                            # Skip marker output lines
+                            if "__MRMD_EXIT_CODE__" in line or "__MRMD_END_MARKER__" in line:
+                                continue
+                            # Skip echo commands for markers
+                            if stripped.startswith("echo __MRMD_"):
+                                continue
+                            # Skip our wrapper command prefix (eval wrapper)
+                            if stripped.startswith("__exit_code__="):
+                                continue
+                            # Skip echoed user commands (PTY echo)
+                            if stripped in code_lines_set:
+                                continue
+                            filtered_lines.append(line)
+                        filtered_chunk = "\n".join(filtered_lines)
+                        if filtered_chunk.strip():
+                            on_output("stdout", filtered_chunk, accumulated)
 
-                    # Check for our unique end marker
-                    if end_marker in accumulated:
+                    # Check for our unique end marker - must be at START of a line
+                    # (not embedded in the echoed command which also contains the marker)
+                    if f"\n{end_marker}" in accumulated:
                         break
 
                 except OSError:
                     break
+            else:
+                # No data available - check if we should request stdin
+                idle_count += 1
+
+                # Debug: Log idle state periodically
+                if idle_count == IDLE_THRESHOLD:
+                    print(f"[bash-worker] Idle threshold reached. accumulated length: {len(accumulated)}", flush=True)
+                    print(f"[bash-worker] marker as output (with newline): {(chr(10) + end_marker) in accumulated}", flush=True)
+                    print(f"[bash-worker] on_stdin_request is not None: {on_stdin_request is not None}", flush=True)
+
+                # Only check for stdin need after being idle for a while
+                # and if we have a callback and the marker hasn't appeared AS OUTPUT
+                # (marker in echoed command doesn't count - need \n before it)
+                marker_as_output = f"\n{end_marker}" in accumulated
+                if (idle_count >= IDLE_THRESHOLD and
+                    on_stdin_request is not None and
+                    not marker_as_output and
+                    accumulated):  # Must have some output
+
+                    # Check if output ends with a prompt pattern
+                    # Strip ANSI codes for pattern matching
+                    clean_output = _strip_ansi(accumulated).rstrip()
+
+                    # Debug: Show what we're checking
+                    if idle_count == IDLE_THRESHOLD:
+                        print(f"[bash-worker] Checking for stdin. Last 100 chars: {repr(clean_output[-100:])}", flush=True)
+
+                    # Check for prompt patterns at end of output
+                    needs_input = False
+                    detected_prompt = ""
+
+                    for pattern in PROMPT_PATTERNS:
+                        if clean_output.endswith(pattern):
+                            needs_input = True
+                            # Extract the prompt (last line or portion)
+                            lines = clean_output.split('\n')
+                            detected_prompt = lines[-1] if lines else pattern
+                            print(f"[bash-worker] Stdin needed! Pattern matched: {repr(pattern)}", flush=True)
+                            break
+
+                    if needs_input:
+                        # Request stdin from user - this BLOCKS until input is provided
+                        request = StdinRequest(
+                            prompt=detected_prompt,
+                            password='password' in detected_prompt.lower(),
+                            exec_id=exec_id or "",
+                        )
+
+                        try:
+                            # Call the callback - it should BLOCK and return the input
+                            user_input = on_stdin_request(request)
+
+                            # Write the input to PTY
+                            if user_input is not None:
+                                # Ensure input ends with newline
+                                if not user_input.endswith('\n'):
+                                    user_input += '\n'
+                                os.write(self._master_fd, user_input.encode('utf-8'))
+
+                            # Reset idle count after providing input
+                            idle_count = 0
+
+                        except InputCancelledError:
+                            raise
+                        except Exception as e:
+                            # If stdin request fails, continue waiting
+                            # (maybe user will interrupt or command will timeout)
+                            pass
 
         # Parse output and exit code
         full_output = "".join(output_parts)
+        print(f"[bash-worker] RAW full_output before filtering: {repr(full_output)}", flush=True)
 
         # Extract exit code using the unique marker
         exit_code = 0
@@ -310,19 +490,45 @@ class BashWorker:
             if store_history:
                 self._execution_count += 1
 
+            print(f"[bash-worker] execute_streaming called. code={repr(code[:50])}, exec_id={exec_id}", flush=True)
+            print(f"[bash-worker] on_stdin_request provided: {on_stdin_request is not None}", flush=True)
+
             try:
+                # Cancel any pending input/command by sending Ctrl+C
+                # This ensures a clean state before running new commands
+                if self._master_fd is not None:
+                    os.write(self._master_fd, b'\x03')  # Ctrl+C
+                    time.sleep(0.05)  # Brief pause for shell to process
+                    # Consume any output from the interrupt
+                    self._read_available(timeout=0.1)
+
                 # Build command with UNIQUE markers for exit code and end detection
                 # Use timestamp to ensure each execution has unique markers
                 exec_marker = f"{_END_MARKER}_{time.time_ns()}"
                 exit_marker = f"{_EXIT_CODE_MARKER}_{time.time_ns()}"
 
-                wrapped_code = f"{code}\necho {exit_marker}$?\necho {exec_marker}"
+                # IMPORTANT: Send user command FIRST, then wait for completion,
+                # then send markers. This prevents interactive commands (read, etc.)
+                # from consuming marker commands as stdin input.
+                #
+                # We use a shell construct that:
+                # 1. Runs the user code
+                # 2. Captures the exit code
+                # 3. Outputs markers AFTER the command finishes
+                #
+                # The eval + subshell approach ensures markers run after user code,
+                # even if user code reads from stdin.
+                # Strip trailing whitespace from code - newlines break single-quote escaping
+                clean_code = code.rstrip()
+                wrapped_code = f"__exit_code__=0; eval {shlex.quote(clean_code)} || __exit_code__=$?; echo {exit_marker}$__exit_code__; echo {exec_marker}"
+                print(f"[bash-worker] Sending wrapped command: {repr(wrapped_code[:100])}", flush=True)
                 self._write_command(wrapped_code)
 
                 # Read until we see the end marker
                 output, exit_code = self._read_until_marker(
-                    code, exec_marker, exit_marker, on_output, on_stdin_request
+                    code, exec_marker, exit_marker, exec_id, on_output, on_stdin_request
                 )
+                print(f"[bash-worker] Got output: {repr(output[:200] if output else 'EMPTY')}, exit_code={exit_code}", flush=True)
 
                 duration = int((time.time() - start_time) * 1000)
 

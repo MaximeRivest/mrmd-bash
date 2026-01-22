@@ -23,6 +23,7 @@ from .types import (
     Capabilities,
     Environment,
     Features,
+    InputCancelledError,
     SessionInfo,
 )
 from .worker import BashWorker
@@ -327,7 +328,15 @@ class MRPServer:
                 )
 
             def on_stdin_request(req):
-                """Callback for stdin requests."""
+                """Callback for stdin requests - BLOCKS until input is provided.
+
+                This mirrors the Python server's behavior:
+                1. Send stdin_request event to client via SSE
+                2. Register pending input with session manager
+                3. Block waiting for POST /input to provide the text
+                4. Return the input text to the worker
+                """
+                # Send stdin_request event to client
                 asyncio.run_coroutine_threadsafe(
                     output_queue.put(
                         {
@@ -335,12 +344,38 @@ class MRPServer:
                             "data": {
                                 "prompt": req.prompt,
                                 "password": req.password,
-                                "exec_id": req.exec_id,
+                                "execId": req.exec_id,
                             },
                         }
                     ),
                     loop,
                 )
+
+                # Register that we're waiting for input
+                input_event = self._sessions.register_pending_input(exec_id)
+
+                # Wait for the input (blocking - we're in a worker thread)
+                async def wait_for_input():
+                    await input_event.wait()
+                    # Check if input was provided or cancelled
+                    value = self._sessions.get_input_value(exec_id)
+                    if value is None:
+                        # Input was cancelled
+                        raise InputCancelledError("Input cancelled by user")
+                    return value
+
+                try:
+                    # Wait up to 5 minutes for input
+                    future = asyncio.run_coroutine_threadsafe(wait_for_input(), loop)
+                    response = future.result(timeout=300)
+                    return response
+                except InputCancelledError:
+                    raise
+                except Exception as e:
+                    raise RuntimeError(f"Failed to get input: {e}")
+                finally:
+                    # Clean up
+                    self._sessions.clear_pending_input(exec_id)
 
             def run_execution():
                 """Run execution in background thread."""
@@ -428,15 +463,14 @@ class MRPServer:
         exec_id = body.get("exec_id")
         text = body.get("text", "")
 
-        session = self._sessions.get_session(session_id)
-        if not session:
+        if not exec_id:
             return _json_response(
-                {"accepted": False, "error": "Session not found"},
-                status_code=404,
+                {"accepted": False, "error": "exec_id is required"},
+                status_code=400,
             )
 
-        worker, _ = session
-        accepted = worker.provide_input(text)
+        # Provide input to the pending request - this signals the blocked callback
+        accepted = self._sessions.provide_input(exec_id, text)
 
         return _json_response({"accepted": accepted})
 
@@ -447,15 +481,14 @@ class MRPServer:
         session_id = body.get("session", "default")
         exec_id = body.get("exec_id")
 
-        session = self._sessions.get_session(session_id)
-        if not session:
+        if not exec_id:
             return _json_response(
-                {"cancelled": False, "error": "Session not found"},
-                status_code=404,
+                {"cancelled": False, "error": "exec_id is required"},
+                status_code=400,
             )
 
-        worker, _ = session
-        cancelled = worker.cancel_input()
+        # Cancel the pending input - this signals the blocked callback with no value
+        cancelled = self._sessions.cancel_input(exec_id)
 
         return _json_response({"cancelled": cancelled})
 
