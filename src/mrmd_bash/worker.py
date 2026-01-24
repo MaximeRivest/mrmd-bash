@@ -4,6 +4,7 @@ from __future__ import annotations
 
 print("[bash-worker] Loading worker module (stdin detection enabled)", flush=True)
 
+import fcntl
 import os
 import pty
 import re
@@ -12,6 +13,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import termios
 import threading
 import time
 from collections.abc import Callable
@@ -36,13 +38,158 @@ from .types import (
 _END_MARKER = "__MRMD_END_MARKER__"
 _EXIT_CODE_MARKER = "__MRMD_EXIT_CODE__"
 
-# ANSI escape code pattern
-_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+# ANSI escape code patterns - comprehensive to handle all terminal escape sequences
+# This includes:
+# - CSI sequences: \x1b[...X (most common, like colors, cursor movement)
+# - Single-char escapes: \x1b7, \x1b8 (save/restore cursor), \x1bM, etc.
+# - OSC sequences: \x1b]...(\x07|\x1b\\) (window title, etc.)
+# - Character set: \x1b(X, \x1b)X
+_ANSI_ESCAPE_PATTERN = re.compile(
+    r"\x1b"  # ESC character
+    r"(?:"
+    r"\[[0-9;?]*[a-zA-Z]"  # CSI sequences: ESC [ params command
+    r"|"
+    r"\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences: ESC ] ... (BEL or ST)
+    r"|"
+    r"[()][A-Z0-9]"  # Character set selection: ESC ( X or ESC ) X
+    r"|"
+    r"[0-9A-Za-z=<>]"  # Single character commands: ESC 7, ESC 8, ESC M, etc.
+    r")"
+)
 
 
 def _strip_ansi(text: str) -> str:
     """Strip ANSI escape codes from text."""
     return _ANSI_ESCAPE_PATTERN.sub("", text)
+
+
+def _make_controlling_tty(slave_fd: int):
+    """Create a preexec_fn that sets up the controlling terminal.
+
+    When mrmd-bash is spawned from Electron (which has no controlling terminal),
+    the bash process won't have a controlling terminal either, even though its
+    stdin/stdout/stderr are connected to a PTY. This causes /dev/tty to fail
+    and scripts that check `[ -t 1 ]` or read from /dev/tty to malfunction.
+
+    This function returns a preexec_fn that uses TIOCSCTTY to make the PTY slave
+    the controlling terminal for the new session, enabling proper terminal behavior.
+    """
+    def _setup():
+        try:
+            # TIOCSCTTY makes the given terminal the controlling terminal
+            # of the calling process. The process must be a session leader
+            # (which it is, due to start_new_session=True) and must not
+            # already have a controlling terminal.
+            tiocsctty = getattr(termios, "TIOCSCTTY", 0x540E)
+            fcntl.ioctl(slave_fd, tiocsctty, 0)
+        except OSError:
+            # This can fail if:
+            # - On macOS: ctty may be assigned automatically when opening tty
+            # - Process already has a controlling terminal
+            # Either way, continue - stdin/stdout are still connected to PTY
+            pass
+    return _setup
+
+
+# Linux-specific stdin detection via /proc/syscall
+# This is more reliable than pattern matching as it directly checks
+# if a process is blocked on read(fd=0)
+_IS_LINUX = os.path.exists("/proc")
+
+
+def _get_descendant_pids(pid: int) -> list[int]:
+    """Get all descendant PIDs of a process (children, grandchildren, etc.)."""
+    descendants = []
+    try:
+        # Read children from /proc/<pid>/task/<pid>/children
+        children_path = f"/proc/{pid}/task/{pid}/children"
+        if os.path.exists(children_path):
+            with open(children_path) as f:
+                children = [int(p) for p in f.read().split() if p]
+        else:
+            # Fallback: scan /proc for processes with this parent
+            children = []
+            for entry in os.listdir("/proc"):
+                if entry.isdigit():
+                    try:
+                        with open(f"/proc/{entry}/stat") as f:
+                            stat = f.read()
+                        # Field 4 is PPID
+                        ppid = int(stat.split()[3])
+                        if ppid == pid:
+                            children.append(int(entry))
+                    except (OSError, ValueError, IndexError):
+                        pass
+
+        descendants.extend(children)
+        for child in children:
+            descendants.extend(_get_descendant_pids(child))
+    except (OSError, ValueError):
+        pass
+    return descendants
+
+
+def _is_process_waiting_for_stdin(pid: int) -> bool | None:
+    """Check if a process is blocked on read(fd=0) using /proc/syscall.
+
+    Returns:
+        True: Process is definitely waiting for stdin
+        False: Process is definitely NOT waiting for stdin
+        None: Unable to determine (not Linux, permission denied, etc.)
+    """
+    if not _IS_LINUX:
+        return None
+
+    try:
+        with open(f"/proc/{pid}/syscall") as f:
+            syscall_info = f.read().strip()
+
+        if syscall_info == "running":
+            return False
+
+        parts = syscall_info.split()
+        if len(parts) < 2:
+            return None
+
+        syscall_num = int(parts[0])
+        # On x86_64 Linux: syscall 0 = read, syscall 17 = pread64
+        # On other architectures the number may differ, but 0 is commonly read
+        if syscall_num == 0:  # read syscall
+            fd = int(parts[1], 16)
+            if fd == 0:  # stdin
+                return True
+        return False
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _is_any_process_waiting_for_stdin(pid: int) -> bool | None:
+    """Check if process or any of its descendants is waiting for stdin.
+
+    This is important because bash may spawn child processes (sh, python, etc.)
+    that are the ones actually waiting for input.
+
+    Returns:
+        True: A process is definitely waiting for stdin
+        False: No process is waiting for stdin
+        None: Unable to determine
+    """
+    if not _IS_LINUX:
+        return None
+
+    pids_to_check = [pid] + _get_descendant_pids(pid)
+
+    any_unknown = False
+    for check_pid in pids_to_check:
+        result = _is_process_waiting_for_stdin(check_pid)
+        if result is True:
+            return True
+        if result is None:
+            any_unknown = True
+
+    # If we checked all and none are waiting, return False
+    # Unless we had some unknowns, in which case return None
+    return None if any_unknown else False
 
 
 class BashWorker:
@@ -166,6 +313,7 @@ class BashWorker:
             cwd=self._cwd,
             env=env,
             start_new_session=True,
+            preexec_fn=_make_controlling_tty(slave_fd),
         )
 
         os.close(slave_fd)
@@ -246,6 +394,7 @@ class BashWorker:
         # Stdin detection state
         idle_count = 0  # Count of consecutive idle iterations (no output)
         IDLE_THRESHOLD = 5  # After 5 iterations (0.5s) of no output, check for stdin need
+        last_input_at_length = 0  # Track when we last provided input to avoid re-prompting
 
         # Common prompt patterns that indicate stdin is needed
         # These patterns at end of output suggest a command is waiting for input
@@ -254,7 +403,8 @@ class BashWorker:
             ':', '?',  # Without trailing space
             'password:', 'Password:', 'PASSWORD:',
             '[y/n]', '[Y/n]', '[y/N]', '[Y/N]',
-            '(yes/no)', '(y/n)',
+            '(y/n)', '(Y/n)', '(y/N)', '(Y/N)',  # Parentheses variants
+            '(yes/no)', '(Yes/No)', '(YES/NO)',
         )
 
         # Get code lines to filter echoed commands (PTY echoes back what we send)
@@ -278,6 +428,10 @@ class BashWorker:
                     chunk = data.decode("utf-8", errors="replace")
                     output_parts.append(chunk)
                     accumulated = "".join(output_parts)
+
+                    # Debug: log when we receive data (especially after providing input)
+                    if last_input_at_length > 0:
+                        print(f"[bash-worker] Received output after input: {len(chunk)} bytes, total: {len(accumulated)}", flush=True)
 
                     # Call output callback with filtered chunk
                     # Filter out: markers, echo commands for markers, and echoed user commands
@@ -324,10 +478,12 @@ class BashWorker:
                 # and if we have a callback and the marker hasn't appeared AS OUTPUT
                 # (marker in echoed command doesn't count - need \n before it)
                 marker_as_output = f"\n{end_marker}" in accumulated
+                has_new_output = len(accumulated) > last_input_at_length
                 if (idle_count >= IDLE_THRESHOLD and
                     on_stdin_request is not None and
                     not marker_as_output and
-                    accumulated):  # Must have some output
+                    accumulated and  # Must have some output
+                    has_new_output):  # Must have NEW output since last input
 
                     # Check if output ends with a prompt pattern
                     # Strip ANSI codes for pattern matching
@@ -337,18 +493,40 @@ class BashWorker:
                     if idle_count == IDLE_THRESHOLD:
                         print(f"[bash-worker] Checking for stdin. Last 100 chars: {repr(clean_output[-100:])}", flush=True)
 
-                    # Check for prompt patterns at end of output
+                    # HYBRID STDIN DETECTION:
+                    # 1. On Linux: Use /proc/syscall to definitively check if waiting for stdin
+                    # 2. Always also check pattern matching as backup (some programs use poll/select)
                     needs_input = False
                     detected_prompt = ""
+                    detection_method = "none"
 
-                    for pattern in PROMPT_PATTERNS:
-                        if clean_output.endswith(pattern):
+                    # Try syscall-based detection first (Linux only, most reliable)
+                    # This catches programs using blocking read(fd=0)
+                    if self._process is not None:
+                        syscall_result = _is_any_process_waiting_for_stdin(self._process.pid)
+                        if syscall_result is True:
+                            # Definitely waiting for stdin!
                             needs_input = True
-                            # Extract the prompt (last line or portion)
+                            detection_method = "syscall"
+                            # Extract prompt from output (last line)
                             lines = clean_output.split('\n')
-                            detected_prompt = lines[-1] if lines else pattern
-                            print(f"[bash-worker] Stdin needed! Pattern matched: {repr(pattern)}", flush=True)
-                            break
+                            detected_prompt = lines[-1] if lines else ""
+                            print(f"[bash-worker] Stdin needed! Detected via /proc/syscall (definitive)", flush=True)
+                        # Note: syscall_result=False doesn't mean NOT waiting - programs may use
+                        # poll/select instead of blocking read. So we still try pattern matching.
+
+                    # Pattern matching - catches programs using poll/select (like Go programs)
+                    # or when syscall detection is unavailable (macOS, etc.)
+                    if not needs_input:
+                        for pattern in PROMPT_PATTERNS:
+                            if clean_output.endswith(pattern):
+                                needs_input = True
+                                detection_method = "pattern"
+                                # Extract the prompt (last line or portion)
+                                lines = clean_output.split('\n')
+                                detected_prompt = lines[-1] if lines else pattern
+                                print(f"[bash-worker] Stdin needed! Pattern matched: {repr(pattern)} (fallback)", flush=True)
+                                break
 
                     if needs_input:
                         # Request stdin from user - this BLOCKS until input is provided
@@ -361,22 +539,32 @@ class BashWorker:
                         try:
                             # Call the callback - it should BLOCK and return the input
                             user_input = on_stdin_request(request)
+                            print(f"[bash-worker] Got user input: {repr(user_input)}", flush=True)
 
                             # Write the input to PTY
                             if user_input is not None:
-                                # Ensure input ends with newline
-                                if not user_input.endswith('\n'):
-                                    user_input += '\n'
+                                # Strip any trailing newlines/carriage returns from UI
+                                user_input = user_input.rstrip('\r\n')
+                                # Send with carriage return - this is what terminals send when Enter is pressed
+                                # In canonical mode, PTY translates \r to \n for the program
+                                # In raw mode, programs receive \r directly (which is what they expect)
+                                user_input += '\r'
                                 os.write(self._master_fd, user_input.encode('utf-8'))
+                                print(f"[bash-worker] Wrote input to PTY: {repr(user_input)}", flush=True)
 
                             # Reset idle count after providing input
                             idle_count = 0
+
+                            # IMPORTANT: Record the length of accumulated output when we sent input
+                            # This prevents re-detecting the same prompt before new output arrives
+                            last_input_at_length = len(accumulated)
 
                         except InputCancelledError:
                             raise
                         except Exception as e:
                             # If stdin request fails, continue waiting
                             # (maybe user will interrupt or command will timeout)
+                            print(f"[bash-worker] stdin request failed: {e}", flush=True)
                             pass
 
         # Parse output and exit code
