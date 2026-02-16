@@ -1,6 +1,6 @@
 [project]
 name = "mrmd-bash"
-version = "0.1.1"
+version = "0.1.2"
 description = "MRP (MRMD Runtime Protocol) server for Bash"
 readme = "README.md"
 requires-python = ">=3.10"

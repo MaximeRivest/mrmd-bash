@@ -202,8 +202,6 @@ class MRPServer:
                 assets=False,
             ),
             lspFallback=None,
-            defaultSession="default",
-            maxSessions=10,
             environment=Environment(
                 cwd=self._cwd,
                 executable=self._bash_path,
@@ -276,12 +274,18 @@ class MRPServer:
                 status_code=404,
             )
 
+    async def handle_reset_runtime(self, request: Request) -> JSONResponse:
+        """POST /reset - Reset the default runtime namespace."""
+        worker, _ = self._sessions.get_or_create_session("default")
+        worker.reset()
+        return _json_response({"success": True})
+
     async def handle_execute(self, request: Request) -> JSONResponse:
         """POST /execute - Execute code and return result."""
         body = await request.json()
 
         code = body.get("code", "")
-        session_id = body.get("session", "default")
+        session_id = "default"
         store_history = body.get("storeHistory", True)
         exec_id = body.get("execId")
 
@@ -301,7 +305,7 @@ class MRPServer:
         body = await request.json()
 
         code = body.get("code", "")
-        session_id = body.get("session", "default")
+        session_id = "default"
         store_history = body.get("storeHistory", True)
         exec_id = body.get("execId", f"exec-{datetime.now().timestamp()}")
 
@@ -459,7 +463,7 @@ class MRPServer:
         """POST /input - Send user input to waiting execution."""
         body = await request.json()
 
-        session_id = body.get("session", "default")
+        session_id = "default"
         exec_id = body.get("exec_id")
         text = body.get("text", "")
 
@@ -478,7 +482,7 @@ class MRPServer:
         """POST /input/cancel - Cancel pending input request."""
         body = await request.json()
 
-        session_id = body.get("session", "default")
+        session_id = "default"
         exec_id = body.get("exec_id")
 
         if not exec_id:
@@ -495,7 +499,7 @@ class MRPServer:
     async def handle_interrupt(self, request: Request) -> JSONResponse:
         """POST /interrupt - Interrupt running execution."""
         body = await request.json()
-        session_id = body.get("session", "default")
+        session_id = "default"
 
         session = self._sessions.get_session(session_id)
         if not session:
@@ -515,7 +519,7 @@ class MRPServer:
 
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
-        session_id = body.get("session", "default")
+        session_id = "default"
 
         worker, _ = self._sessions.get_or_create_session(session_id)
 
@@ -544,7 +548,7 @@ class MRPServer:
 
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
-        session_id = body.get("session", "default")
+        session_id = "default"
 
         worker, _ = self._sessions.get_or_create_session(session_id)
 
@@ -560,7 +564,7 @@ class MRPServer:
         """POST /variables - List session variables."""
         body = await request.json()
 
-        session_id = body.get("session", "default")
+        session_id = "default"
         filter_config = body.get("filter", {})
         name_pattern = filter_config.get("namePattern")
 
@@ -579,7 +583,7 @@ class MRPServer:
         name = request.path_params["name"]
         body = await request.json()
 
-        session_id = body.get("session", "default")
+        session_id = "default"
         path = body.get("path", [])
 
         worker, _ = self._sessions.get_or_create_session(session_id)
@@ -597,7 +601,7 @@ class MRPServer:
         body = await request.json()
 
         code = body.get("code", "")
-        session_id = body.get("session", "default")
+        session_id = "default"
 
         worker, _ = self._sessions.get_or_create_session(session_id)
         result = worker.is_complete(code)
@@ -630,12 +634,7 @@ class MRPServer:
         routes = [
             # Capabilities
             Route("/mrp/v1/capabilities", self.handle_capabilities, methods=["GET"]),
-            # Sessions
-            Route("/mrp/v1/sessions", self.handle_list_sessions, methods=["GET"]),
-            Route("/mrp/v1/sessions", self.handle_create_session, methods=["POST"]),
-            Route("/mrp/v1/sessions/{id}", self.handle_get_session, methods=["GET"]),
-            Route("/mrp/v1/sessions/{id}", self.handle_delete_session, methods=["DELETE"]),
-            Route("/mrp/v1/sessions/{id}/reset", self.handle_reset_session, methods=["POST"]),
+            Route("/mrp/v1/reset", self.handle_reset_runtime, methods=["POST"]),
             # Execution
             Route("/mrp/v1/execute", self.handle_execute, methods=["POST"]),
             Route("/mrp/v1/execute/stream", self.handle_execute_stream, methods=["POST"]),
