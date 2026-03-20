@@ -1,4 +1,10 @@
-# Python
+# Go
+bin/
+*.test
+*.out
+coverage.out
+
+# Legacy Python build artifacts
 __pycache__/
 *.py[cod]
 *$py.class

@@ -1,37 +1,36 @@
 # mrmd-bash
 
-MRP (MRMD Runtime Protocol) server for Bash. Enables notebook-style editors to execute Bash code with persistent sessions, completions, and variable inspection.
+MRP (MRMD Runtime Protocol) server for Bash, implemented in Go.
 
-## Installation
+One `mrmd-bash` server process = one persistent Bash runtime namespace.
+If you need another isolated namespace, start another server process on another port.
 
-```bash
-pip install mrmd-bash
-```
-
-Or with uv:
+## Build
 
 ```bash
-uv pip install mrmd-bash
+go build -o bin/mrmd-bash ./cmd/mrmd-bash
 ```
 
 ## Usage
 
-Start the server:
-
 ```bash
-mrmd-bash --port 8001
+./bin/mrmd-bash --port 8001
 ```
 
-The server will be available at `http://localhost:8001/mrp/v1/`.
+Server URL:
+
+```text
+http://localhost:8001/mrp/v1/
+```
 
 ### Options
 
-```
---host HOST       Host to bind to (default: 127.0.0.1)
---port PORT       Port to bind to (default: 8001)
---cwd PATH        Working directory for bash sessions
---log-level LEVEL Log level: debug, info, warning, error (default: info)
---reload          Enable auto-reload for development
+```text
+--host HOST        Host to bind to (default: 127.0.0.1)
+--port PORT        Port to bind to (default: 8001)
+--cwd PATH         Working directory for the bash runtime
+--log-level LEVEL  Log level: debug, info, warning, error (default: info)
+--reload           Accepted for CLI compatibility; no-op in Go
 ```
 
 ## Features
@@ -41,25 +40,26 @@ The server will be available at `http://localhost:8001/mrp/v1/`.
 | `execute` | ✅ | Run code and return result |
 | `executeStream` | ✅ | Stream output via SSE |
 | `interrupt` | ✅ | Cancel running execution (SIGINT) |
-| `complete` | ✅ | Completions via compgen |
+| `complete` | ✅ | Completions via `compgen` |
 | `inspect` | ❌ | Not supported |
 | `hover` | ✅ | Variable values and command types |
-| `variables` | ✅ | Environment and shell variables |
+| `variables` | ✅ | Shell and environment variables from the live session |
 | `variableExpand` | ❌ | Bash variables are flat |
-| `reset` | ✅ | Restart bash session |
+| `reset` | ✅ | Restart bash runtime namespace |
 | `isComplete` | ✅ | Detect incomplete statements |
 | `format` | ❌ | Not supported |
+| `history` | ✅ | Browse execution input history for up-arrow / Ctrl-R, persisted via `$HISTFILE` / `~/.bash_history` |
 | `assets` | ❌ | Not supported |
 
 ## API Examples
 
-### Check capabilities
+### Capabilities
 
 ```bash
 curl http://localhost:8001/mrp/v1/capabilities
 ```
 
-### Execute code
+### Execute
 
 ```bash
 curl -X POST http://localhost:8001/mrp/v1/execute \
@@ -67,20 +67,26 @@ curl -X POST http://localhost:8001/mrp/v1/execute \
   -d '{"code": "echo Hello, World!"}'
 ```
 
-### Get completions
-
-```bash
-curl -X POST http://localhost:8001/mrp/v1/complete \
-  -H "Content-Type: application/json" \
-  -d '{"code": "ec", "cursor": 2}'
-```
-
-### List variables
+### Variables
 
 ```bash
 curl -X POST http://localhost:8001/mrp/v1/variables \
   -H "Content-Type: application/json" \
-  -d '{"session": "default"}'
+  -d '{}'
+```
+
+### Reset runtime
+
+```bash
+curl -X POST http://localhost:8001/mrp/v1/reset
+```
+
+### History
+
+```bash
+curl -X POST http://localhost:8001/mrp/v1/history \
+  -H "Content-Type: application/json" \
+  -d '{"n": 20}'
 ```
 
 ### Stream execution
@@ -91,62 +97,29 @@ curl -X POST http://localhost:8001/mrp/v1/execute/stream \
   -d '{"code": "for i in 1 2 3; do echo $i; sleep 1; done"}'
 ```
 
-## Sessions
+## Runtime Model
 
-Sessions maintain persistent Bash state:
-- Environment variables persist between executions
-- Working directory changes persist
-- Shell functions and aliases persist
+Runtime state persists between executions:
+- environment variables persist
+- working directory changes persist
+- shell functions and aliases persist
 
-```bash
-# Create a session
-curl -X POST http://localhost:8001/mrp/v1/sessions \
-  -H "Content-Type: application/json" \
-  -d '{"id": "my-session"}'
+To get a fresh namespace, either:
+- call `POST /mrp/v1/reset`, or
+- start a new `mrmd-bash` process
 
-# Execute in session
-curl -X POST http://localhost:8001/mrp/v1/execute \
-  -H "Content-Type: application/json" \
-  -d '{"code": "export MY_VAR=hello", "session": "my-session"}'
-
-# Variable persists
-curl -X POST http://localhost:8001/mrp/v1/execute \
-  -H "Content-Type: application/json" \
-  -d '{"code": "echo $MY_VAR", "session": "my-session"}'
-
-# Reset session (clear state)
-curl -X POST http://localhost:8001/mrp/v1/sessions/my-session/reset
-
-# Delete session
-curl -X DELETE http://localhost:8001/mrp/v1/sessions/my-session
-```
-
-## Completions
-
-The server provides completions via bash's `compgen`:
-
-- **Commands**: builtins, functions, aliases, executables
-- **Files**: paths with `/` prefix
-- **Variables**: names with `$` prefix
-
-## Development
-
-```bash
-# Clone and install in development mode
-git clone <repo>
-cd mrmd-bash
-pip install -e ".[dev]"
-
-# Run with auto-reload
-mrmd-bash --reload
-
-# Run tests
-pytest
-```
+History is persisted separately via Bash's native history file (`$HISTFILE`, defaulting to `~/.bash_history`), so `reset` clears the runtime namespace but does not erase command history.
 
 ## Protocol
 
-This server implements the [MRMD Runtime Protocol (MRP)](../mrmd-editor/PROTOCOL.md).
+This server implements the shared MRP spec at:
+- `../spec/mrp-protocol.md`
+
+## Notes
+
+- `stdout` / `stderr` are delivered from a PTY-backed interactive bash session.
+- ANSI escape sequences are preserved in streamed output.
+- Interactive input is supported through `/mrp/v1/input` and `/mrp/v1/input/cancel`.
 
 ## License
 
