@@ -50,6 +50,12 @@ type BashWorker struct {
 	executionCount int
 	cmd            *exec.Cmd
 	ptyFile        *os.File
+
+	// interruptPty is a separate reference to the PTY master, protected by
+	// its own mutex so Interrupt() can write Ctrl+C without acquiring w.mu
+	// (which is held for the entire duration of ExecuteStreaming).
+	interruptMu  sync.Mutex
+	interruptPty *os.File
 }
 
 func NewBashWorker(cwd string, extraEnv map[string]string) (*BashWorker, error) {
@@ -417,21 +423,21 @@ func (w *BashWorker) GetHistory(n int, pattern string, before *int) HistoryResul
 }
 
 func (w *BashWorker) Interrupt() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	// Write Ctrl+C (ETX, 0x03) to the PTY master. The terminal driver
+	// delivers SIGINT to the foreground process group, which correctly
+	// handles job control (child commands in their own process groups).
+	//
+	// We use interruptPty with its own mutex instead of w.mu because
+	// ExecuteStreaming holds w.mu for the entire execution duration.
+	w.interruptMu.Lock()
+	f := w.interruptPty
+	w.interruptMu.Unlock()
 
-	if w.cmd == nil || w.cmd.Process == nil {
+	if f == nil {
 		return false
 	}
-
-	pgid, err := syscall.Getpgid(w.cmd.Process.Pid)
-	if err != nil {
-		return false
-	}
-	if err := syscall.Kill(-pgid, syscall.SIGINT); err != nil {
-		return false
-	}
-	return true
+	_, err := f.Write([]byte{3}) // Ctrl+C
+	return err == nil
 }
 
 func (w *BashWorker) Reset() error {
@@ -482,6 +488,10 @@ func (w *BashWorker) ensureStartedLocked() error {
 
 	w.cmd = cmd
 	w.ptyFile = ptyFile
+
+	w.interruptMu.Lock()
+	w.interruptPty = ptyFile
+	w.interruptMu.Unlock()
 
 	time.Sleep(150 * time.Millisecond)
 	_, _ = w.readAvailableLocked(300 * time.Millisecond)
@@ -827,6 +837,10 @@ func (w *BashWorker) killProcessLocked() {
 	}
 	w.cmd = nil
 	w.ptyFile = nil
+
+	w.interruptMu.Lock()
+	w.interruptPty = nil
+	w.interruptMu.Unlock()
 }
 
 func compileOptionalPattern(filterPattern string) (*regexp.Regexp, error) {
